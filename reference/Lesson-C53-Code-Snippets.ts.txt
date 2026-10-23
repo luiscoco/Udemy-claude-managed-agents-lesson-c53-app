@@ -1,0 +1,55 @@
+// Bounded UTF-8 artifact handoff between host-managed sessions.
+import { z } from "zod";
+import { createHash } from "node:crypto";
+import type Anthropic from "@anthropic-ai/sdk";
+const Handoff = z.strictObject({ taskId: z.string().regex(/^[a-z0-9-]{1,60}$/),
+  targetRole: z.enum(["developer", "reviewer"]), summary: z.string().min(1).max(1000),
+  artifactHash: z.string().regex(/^[a-f0-9]{64}$/), expectedVersion: z.number().int().nonnegative() });
+export const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+export const key = (owner: string, task: string) => JSON.stringify([owner, task]);
+export type State = { version: number; artifactHash: string; activeSessionId: string };
+export type Artifact = { ownerId: string; taskId: string; bytes: Uint8Array };
+export type Delivery = { phase: "reserved" | "creating" | "created" | "uncertain"; nextSessionId?: string;
+  taskId: string; target: { id: string; version: number }; artifactHash: string; text: string };
+export function prepare(raw: unknown, origin: { ownerId: string; sessionId: string; role: "planner" | "developer" },
+  states: Map<string, State>, artifacts: ReadonlyMap<string, Artifact>,
+  approvedTargets: ReadonlyMap<string, { id: string; version: number }>): Delivery {
+  const input = Handoff.parse(raw);
+  const state = states.get(key(origin.ownerId, input.taskId));
+  const target = approvedTargets.get(input.targetRole);
+  const required = origin.role === "planner" ? "developer" : "reviewer";
+  if (!state || state.activeSessionId !== origin.sessionId || state.version !== input.expectedVersion ||
+      state.artifactHash !== input.artifactHash || input.targetRole !== required || !target)
+    throw new Error("Unauthorized or stale handoff");
+  const artifact = artifacts.get(input.artifactHash);
+  if (!artifact || artifact.ownerId !== origin.ownerId || artifact.taskId !== input.taskId ||
+      artifact.bytes.byteLength > 16384 || hash(artifact.bytes) !== input.artifactHash)
+    throw new Error("Invalid artifact record");
+  const artifactText = new TextDecoder("utf-8", { fatal: true }).decode(artifact.bytes);
+  const text = JSON.stringify({ kind: "handoff_data", taskId: input.taskId,
+    artifactHash: input.artifactHash, summary: input.summary, artifactText });
+  // In-process CAS: reserve once before network work; persist atomically in production.
+  state.version++; state.activeSessionId = "handoff-reserved";
+  return { phase: "reserved", taskId: input.taskId, target: { ...target }, artifactHash: input.artifactHash, text };
+}
+export async function start(client: Anthropic, delivery: Delivery, authorizedEnvironmentId: string) {
+  if (delivery.phase !== "reserved") throw new Error("Handoff already claimed");
+  delivery.phase = "creating";
+  try {
+    const session = await client.beta.sessions.create({
+      agent: { type: "agent", ...delivery.target }, environment_id: authorizedEnvironmentId,
+      budget: { type: "limit", max_list_cost: { amount: "20", currency: "USD" } },
+      initial_events: [{ type: "user.message", content: [{ type: "text", text: delivery.text }] }]
+    }, { maxRetries: 0, timeout: 10000 });
+    delivery.nextSessionId = session.id; delivery.phase = "created";
+    return session.id;
+  } catch (error) { delivery.phase = "uncertain"; throw error; }
+}
+// Scope artifact lookup by owner/task as well as digest in a real object store;
+// this small map rejects cross-owner reuse rather than implementing deduplicated storage.
+// Actual bytes (not only a summary/hash) are included for this small text fixture.
+// Larger/binary artifacts need authorized file resources or a scoped retrieval tool.
+// Protect approved target IDs/versions and origin identity in server storage.
+// Durable task reservation + outbox + reconciliation is required across restarts.
+// Created is not processed/accepted: observe the new session and update ownership
+// only after the application handoff protocol succeeds. A host Map is not durable.
