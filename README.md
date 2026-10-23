@@ -42,26 +42,71 @@ CLAUDE_MANAGED_ENVIRONMENT_ID=your_environment_id
 PORT=3053
 ```
 
-## How the application was developed
+## How the app was build
 
-The browser collects inputs; the Node host validates requests; the lesson implementation produces observable evidence. The architecture page walks through the real source with numbered steps, prerequisite configuration, source filenames and code excerpts.
+### 1. Reserve only the expected shared-state version
 
-### Lesson implementation
+The experiment starts at version 1. A mismatched expected version leaves the handoff unclaimed instead of overwriting a changed owner/task state.
 
-[src/lesson.ts](https://github.com/luiscoco/Udemy-claude-managed-agents-lesson-c53-app/blob/main/src/lesson.ts)
+Source: [src/lesson.ts](src/lesson.ts#L13)
 
 ```typescript
-  async run(input) {
-
-if(number(input,"expectedVersion")!==1)return report("conflict","Shared task state changed",{phase:"unclaimed"},["Compare the current state version before reserving"]);
-const bytes=text(input,"artifact"),role=text(input,"targetRole");if(!["developer","reviewer"].includes(role)||Buffer.byteLength(bytes)>4096)return report("rejected","Target or artifact size is outside the reviewed handoff",{},["Authorize the target and bound the artifact"]);
-return report("passed","Reserved a byte-bound local handoff",{phase:"reserved",artifactHash:hash(bytes),artifactBytes:Buffer.byteLength(bytes),payload:{role,artifact:bytes},recipientAccepted:false,ownershipAdvanced:false},["Bind owner, task and artifact","Reserve current shared state","Include the actual bytes","Advance ownership only after recipient acceptance"]);
-
-  }
-};
+if (number(input, "expectedVersion") !== 1)
+  return report("conflict", "Shared task state changed", { phase: "unclaimed" }, [
+    "Compare the current state version before reserving",
+  ]);
 ```
 
-Read the architecture page for the remaining source excerpts and explanations, including input handling and optional provider behavior. The diagram describes this application, rather than implying that an external integration has been implemented.
+### 2. Bind and bound the actual handoff bytes
+
+Only developer or reviewer targets are allowed, and the artifact must fit the byte cap. The reserved payload includes the bytes and hash; recipientAccepted and ownershipAdvanced remain false until a separate acceptance step exists.
+
+Source: [src/lesson.ts](src/lesson.ts#L14) · selected statements
+
+```typescript
+const bytes = text(input, "artifact"),
+  role = text(input, "targetRole");
+
+// ... other source statements omitted ...
+return report(
+  "passed",
+  "Reserved a byte-bound local handoff",
+  {
+    phase: "reserved",
+    artifactHash: hash(bytes),
+    artifactBytes: Buffer.byteLength(bytes),
+    payload: { role, artifact: bytes },
+    recipientAccepted: false,
+    ownershipAdvanced: false,
+  },
+  [
+    "Bind owner, task and artifact",
+    "Reserve current shared state",
+    "Include the actual bytes",
+    "Advance ownership only after recipient acceptance",
+  ],
+);
+```
+
+### Check your understanding
+
+Run **Reserve a valid artifact handoff** in the application. Compare the result with these scenario expectations:
+
+```json
+{
+  "input": {
+    "artifact": "approved plan",
+    "expectedVersion": 1,
+    "targetRole": "developer"
+  },
+  "expectedOutcome": "passed",
+  "checkEvidence": {
+    "phase": "reserved"
+  }
+}
+```
+
+Then try **Reject stale shared state**. Its expected outcome is `conflict`; identify the condition or evidence field that explains the difference.
 
 ## Validation
 
